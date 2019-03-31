@@ -1019,236 +1019,56 @@ void Adafruit_SPITFT::dmaWait(void) {
     @param  len    Number of pixels to draw.
 */
 void Adafruit_SPITFT::writeColor(uint16_t color, uint32_t len) {
+    if (!len) {
+        return; // Avoid 0-byte transfers
+    }
 
-    if(!len) return; // Avoid 0-byte transfers
-
+#if 0
     uint8_t hi = color >> 8, lo = color;
-
-#if defined(ESP32) // ESP32 has a special SPI pixel-writing function...
-    if(connection == TFT_HARD_SPI) {
-        #define SPI_MAX_PIXELS_AT_ONCE 32
-        #define TMPBUF_LONGWORDS       (SPI_MAX_PIXELS_AT_ONCE + 1) / 2
-        #define TMPBUF_PIXELS          (TMPBUF_LONGWORDS * 2)
-        static uint32_t temp[TMPBUF_LONGWORDS];
-        uint32_t        c32    = color * 0x00010001;
-        uint16_t        bufLen = (len < TMPBUF_PIXELS) ? len : TMPBUF_PIXELS,
-                        xferLen, fillLen;
-        // Fill temp buffer 32 bits at a time
-        fillLen = (bufLen + 1) / 2; // Round up to next 32-bit boundary
-        for(uint32_t t=0; t<fillLen; t++) {
-            temp[t] = c32;
-        }
-        // Issue pixels in blocks from temp buffer
-        while(len) {                                 // While pixels remain
-            xferLen = (bufLen < len) ? bufLen : len; // How many this pass?
-            writePixels((uint16_t *)temp, xferLen);
-            len -= xferLen;
-        }
-        return;
+    while(len--) {
+        // hwspi._spi->transfer(hi);
+        // hwspi._spi->transfer(lo);
+        hwspi._spi->transfer16(color);
     }
-#else  // !ESP32
- #if defined(USE_SPI_DMA)
-    if(((connection == TFT_HARD_SPI) || (connection == TFT_PARALLEL)) &&
-       (len >= 16)) { // Don't bother with DMA on short pixel runs
-        int i, d, numDescriptors;
-        if(hi == lo) { // If high & low bytes are same...
-            onePixelBuf = color;
-            // Can do this with a relatively short descriptor list,
-            // each transferring a max of 32,767 (not 32,768) pixels.
-            // This won't run off the end of the allocated descriptor list,
-            // since we're using much larger chunks per descriptor here.
-            numDescriptors = (len + 32766) / 32767;
-            for(d=0; d<numDescriptors; d++) {
-                int count = (len < 32767) ? len : 32767;
-                descriptor[d].SRCADDR.reg       = (uint32_t)&onePixelBuf;
-                descriptor[d].BTCTRL.bit.SRCINC = 0;
-                descriptor[d].BTCNT.reg         = count * 2;
-                descriptor[d].DESCADDR.reg      = (uint32_t)&descriptor[d+1];
-                len -= count;
-            }
-            descriptor[d-1].DESCADDR.reg        = 0;
-        } else {
-            // If high and low bytes are distinct, it's necessary to fill
-            // a buffer with pixel data (swapping high and low bytes because
-            // TFT and SAMD are different endianisms) and create a longer
-            // descriptor list pointing repeatedly to this data. We can do
-            // this slightly faster working 2 pixels (32 bits) at a time.
-            uint32_t *pixelPtr  = (uint32_t *)pixelBuf[0],
-                      twoPixels = __builtin_bswap16(color) * 0x00010001;
-            // We can avoid some or all of the buffer-filling if the color
-            // is the same as last time...
-            if(color == lastFillColor) {
-                // If length is longer than prior instance, fill only the
-                // additional pixels in the buffer and update lastFillLen.
-                if(len > lastFillLen) {
-                    int fillStart = lastFillLen / 2,
-                        fillEnd   = (((len < maxFillLen) ?
-                                       len : maxFillLen) + 1) / 2;
-                    for(i=fillStart; i<fillEnd; i++) pixelPtr[i] = twoPixels;
-                    lastFillLen = fillEnd * 2;
-                } // else do nothing, don't set pixels or change lastFillLen
-            } else {
-                int fillEnd = (((len < maxFillLen) ?
-                                 len : maxFillLen) + 1) / 2;
-                for(i=0; i<fillEnd; i++) pixelPtr[i] = twoPixels;
-                lastFillLen   = fillEnd * 2;
-                lastFillColor = color;
+#else
+    switch (len) {
+    case 4:
+        hwspi._spi->transfer16(color);
+        [[fallthrough]];
+
+    case 3:
+        hwspi._spi->transfer16(color);
+        [[fallthrough]];
+
+    case 2:
+        hwspi._spi->transfer16(color);
+        [[fallthrough]];
+
+    case 1:
+        hwspi._spi->transfer16(color);
+        break;
+
+    default:
+        {
+            constexpr uint32_t BLOCKSIZE { 32 };
+            static uint16_t data[BLOCKSIZE];
+
+            const uint16_t c { static_cast<uint16_t>(((color & 0xff) << 8) | (color >> 8)) };
+            const uint32_t count { std::min(BLOCKSIZE, len) };
+            for (uint32_t i { 0 }; i < count; ++i) {
+                data[i] = c;
             }
 
-            numDescriptors = (len + maxFillLen - 1) / maxFillLen;
-            for(d=0; d<numDescriptors; d++) {
-                int pixels = (len < maxFillLen) ? len : maxFillLen,
-                    bytes  = pixels * 2;
-                descriptor[d].SRCADDR.reg       = (uint32_t)pixelPtr + bytes;
-                descriptor[d].BTCTRL.bit.SRCINC = 1;
-                descriptor[d].BTCNT.reg         = bytes;
-                descriptor[d].DESCADDR.reg      = (uint32_t)&descriptor[d+1];
-                len -= pixels;
+            const uint32_t n { len / BLOCKSIZE };
+            uint32_t i;
+            for (i = 0; i < n; ++i) {
+                hwspi._spi->transfer(data, nullptr, sizeof(data));
             }
-            descriptor[d-1].DESCADDR.reg        = 0;
+            hwspi._spi->transfer(data, nullptr, (len - i * BLOCKSIZE) * sizeof(uint16_t));
+        break;
         }
-        memcpy(dptr, &descriptor[0], sizeof(DmacDescriptor));
- #if defined(__SAMD51__)
-        if(connection == TFT_PARALLEL) {
-            // Switch WR pin to PWM or CCL
-            pinPeripheral(tft8._wr, wrPeripheral);
-        }
- #endif // end __SAMD51__
-
-        dma_busy = true;
-        dma.startJob();
-        if(connection == TFT_PARALLEL) dma.trigger();
-        while(dma_busy); // Wait for completion
-        // Unfortunately blocking is necessary. An earlier version returned
-        // immediately and checked dma_busy on startWrite() instead, but it
-        // turns out to be MUCH slower on many graphics operations (as when
-        // drawing lines, pixel-by-pixel), perhaps because it's a volatile
-        // type and doesn't cache. Working on this.
-  #if defined(__SAMD51__)
-        if(connection == TFT_HARD_SPI) {
-            // SAMD51: SPI DMA seems to leave the SPI peripheral in a freaky
-            // state on completion. Workaround is to explicitly set it back...
-            hwspi._spi->setDataMode(SPI_MODE0);
-        } else {
-            pinPeripheral(tft8._wr, PIO_OUTPUT); // Switch WR back to GPIO
-        }
-  #endif // end __SAMD51__
-        return;
     }
- #endif // end USE_SPI_DMA
-#endif // end !ESP32
-
-    // All other cases (non-DMA hard SPI, bitbang SPI, parallel)...
-
-    if(connection == TFT_HARD_SPI) {
-#if defined(ESP8266)
-        do {
-            uint32_t pixelsThisPass = len;
-            if(pixelsThisPass > 50000) pixelsThisPass = 50000;
-            len -= pixelsThisPass;
-            yield(); // Periodic yield() on long fills
-            while(pixelsThisPass--) {
-                hwspi._spi->write(hi);
-                hwspi._spi->write(lo);
-            }
-        } while(len);
-#else  // !ESP8266
-        while(len--) {
- #if defined(__AVR__)
-            for(SPDR = hi; !(SPSR & _BV(SPIF)); );
-            for(SPDR = lo; !(SPSR & _BV(SPIF)); );
- #elif defined(ESP32)
-            hwspi._spi->write(hi);
-            hwspi._spi->write(lo);
- #else
-            hwspi._spi->transfer(hi);
-            hwspi._spi->transfer(lo);
- #endif
-        }
-#endif // end !ESP8266
-    } else if(connection == TFT_SOFT_SPI) {
-#if defined(ESP8266)
-        do {
-            uint32_t pixelsThisPass = len;
-            if(pixelsThisPass > 20000) pixelsThisPass = 20000;
-            len -= pixelsThisPass;
-            yield(); // Periodic yield() on long fills
-            while(pixelsThisPass--) {
-                for(uint16_t bit=0, x=color; bit<16; bit++) {
-                    if(x & 0x8000) SPI_MOSI_HIGH();
-                    else           SPI_MOSI_LOW();
-                    SPI_SCK_HIGH();
-                    SPI_SCK_LOW();
-                    x <<= 1;
-                }
-            }
-        } while(len);
-#else  // !ESP8266
-        while(len--) {
- #if defined(__AVR__)
-            for(uint8_t bit=0, x=hi; bit<8; bit++) {
-                if(x & 0x80) SPI_MOSI_HIGH();
-                else         SPI_MOSI_LOW();
-                SPI_SCK_HIGH();
-                SPI_SCK_LOW();
-                x <<= 1;
-            }
-            for(uint8_t bit=0, x=lo; bit<8; bit++) {
-                if(x & 0x80) SPI_MOSI_HIGH();
-                else         SPI_MOSI_LOW();
-                SPI_SCK_HIGH();
-                SPI_SCK_LOW();
-                x <<= 1;
-            }
- #else  // !__AVR__
-            for(uint16_t bit=0, x=color; bit<16; bit++) {
-                if(x & 0x8000) SPI_MOSI_HIGH();
-                else           SPI_MOSI_LOW();
-                SPI_SCK_HIGH();
-                x <<= 1;
-                SPI_SCK_LOW();
-            }
- #endif // end !__AVR__
-        }
-#endif // end !ESP8266
-    } else { // PARALLEL
-        if(hi == lo) {
-#if defined(__AVR__)
-            len            *= 2;
-            *tft8.writePort = hi;
-            while(len--) {
-                TFT_WR_STROBE();
-            }
-#elif defined(USE_FAST_PINIO)
-            if(!tft8.wide) {
-                len            *= 2;
-                *tft8.writePort = hi;
-            } else {
-                *(volatile uint16_t *)tft8.writePort = color;
-            }
-            while(len--) {
-                TFT_WR_STROBE();
-            }
 #endif
-        } else {
-            while(len--) {
-#if defined(__AVR__)
-                *tft8.writePort = hi;
-                TFT_WR_STROBE();
-                *tft8.writePort = lo;
-#elif defined(USE_FAST_PINIO)
-                if(!tft8.wide) {
-                    *tft8.writePort = hi;
-                    TFT_WR_STROBE();
-                    *tft8.writePort = lo;
-                } else {
-                    *(volatile uint16_t *)tft8.writePort = color;
-                }
-#endif
-                TFT_WR_STROBE();
-            }
-        }
-    }
 }
 
 /*!
